@@ -1,0 +1,45 @@
+version: "3.8"
+
+services:
+  # Used in Scenario 1: server-level max_connections is the bottleneck
+  postgres-limited:
+    image: postgres:16
+    container_name: pg-limited
+    environment:
+      POSTGRES_DB: demo
+      POSTGRES_USER: demo
+      POSTGRES_PASSWORD: demo
+    command: >
+      postgres
+        -c max_connections=10
+        -c log_connections=on
+        -c log_disconnections=on
+        -c log_min_messages=LOG
+    ports:
+      - "5441:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U demo -d demo"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Used in Scenarios 2, 3, 4, and load test
+  postgres-normal:
+    image: postgres:16
+    container_name: pg-normal
+    environment:
+      POSTGRES_DB: demo
+      POSTGRES_USER: demo
+      POSTGRES_PASSWORD: demo
+    command: >
+      postgres
+        -c max_connections=200
+        -c log_connections=on
+        -c log_disconnections=on
+    ports:
+      - "5440:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U demo -d demo"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
