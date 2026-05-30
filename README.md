@@ -200,6 +200,101 @@ After 3 seconds of idleness, all 10 connections are closed. `MaxIdleTimeClosed` 
 **Key lesson:**  
 Use `SetConnMaxIdleTime` to avoid holding connections to a server that may have restarted, or to a managed database (like AWS RDS) that closes idle connections after a few minutes on its own.
 
+### Part C — BENEFIT: Idle Connections Speed Up Queries
+
+We run 20 sequential `SELECT 1` queries — a near-instant query — and measure each one individually. The only source of latency difference between the two configs is **connection setup overhead**.
+
+```
+--- Config A: MaxIdleConns=0 (pool closes connection after every query) ---
+  query  1:  15.55 ms  [new conn]
+  query  2:   7.38 ms  [new conn]
+  query  3:   5.33 ms  [new conn]
+  ...
+  query 20:   4.37 ms  [new conn]   ← pays TCP + auth cost every single time
+
+--- Config B: MaxIdleConns=1 (pool keeps one idle connection) ---
+  query  1:   4.28 ms  [new conn]   ← first query still opens a connection
+  query  2:   0.40 ms  [reused]     ← reuses the idle connection, no setup cost
+  query  3:   0.33 ms  [reused]
+  ...
+  query 20:   0.41 ms  [reused]
+
+Result:
+  Config A  avg: 4.97 ms/query   (new connection every time)
+  Config B  avg: 0.34 ms/query   (reusing idle connection)
+  Idle pool is 14.8x faster
+
+  MaxIdleClosed  A=20   B=0
+  (Config A discarded every connection; Config B reused them)
+```
+
+Why is Config A slower on every single query? Each time, it goes through:
+1. Open TCP socket to PostgreSQL
+2. Send startup message
+3. Authenticate (username + password check)
+4. Run the query
+5. Close the TCP socket
+
+Config B only does steps 1–3 once (on query 1). Every query after that skips straight to step 4.
+
+**Key lesson:**  
+With `MaxIdleConns=0`, your app pays 5–15ms of connection setup overhead on **every single query**. A service doing 100 req/s would waste 500–1500ms of CPU time per second just on reconnecting. A properly sized idle pool is one of the cheapest performance wins you can get.
+
+### Part D — COST: Too Many Idle Connections Waste Server Resources
+
+PostgreSQL is different from many other databases: it spawns **one OS process per connection**, even if that connection is completely idle. This is called the process-per-connection model.
+
+Each idle backend process:
+- Holds ~5–10 MB of memory on the server
+- Consumes one slot from `max_connections`
+- Keeps file descriptors and shared memory structures allocated
+
+We open 30 idle connections and ask PostgreSQL directly what it sees:
+
+```
+App pool after burst:
+  Idle=30  InUse=0  OpenConnections=30
+
+PostgreSQL pg_stat_activity — the server's view:
+  state           count
+  -----           -----
+  idle            29   ← our pool connections doing nothing
+  active           1   ← this pg_stat_activity query itself
+
+Connection slot usage on the server:
+  Used      : 30
+  Max       : 200  (max_connections)
+  Remaining : 170
+```
+
+Now imagine you have multiple instances of your app, each holding 30 idle connections:
+
+```
+Instances   Total idle conns   % of max_connections   Slots left for queries
+---------   ----------------   --------------------   ----------------------
+1           30                 15%                    170
+3           90                 45%                    110
+5           150                75%                    50
+10          300                150%                   -100  ← SERVER FULL
+```
+
+With 10 instances × 30 idle connections = 300 connections, you have **exceeded max_connections=200**. New connections will be rejected with `sorry, too many clients already` — even though all 300 existing connections are just sitting idle doing nothing.
+
+**Key lesson:**  
+Idle connections are not free. They cost the PostgreSQL server memory and connection slots.  
+The right `MaxIdleConns` is your **typical concurrent requests per instance** — not "as many as possible".
+
+```
+Good rule of thumb:
+  MaxOpenConns = max_connections / number_of_app_instances
+  MaxIdleConns = typical_concurrent_requests_per_instance
+
+Example: max_connections=200, 5 instances, 10 concurrent requests each
+  MaxOpenConns = 200 / 5 = 40
+  MaxIdleConns = 10
+  Total idle connections at rest = 5 × 10 = 50  (25% of server capacity)
+```
+
 ---
 
 ## Scenario 4 — Timeout Parameters
