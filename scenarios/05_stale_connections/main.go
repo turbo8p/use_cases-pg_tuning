@@ -7,7 +7,7 @@
 //
 //   Network intermediary          Type                 Default idle timeout
 //   ─────────────────────────────────────────────────────────────────────
-//   AWS ALB                       Load balancer        60 s
+//   AWS Application Load Balancer  Load balancer        60 s
 //   Azure SQL Gateway             Database gateway     30 s  (hard limit)
 //   GCP Cloud SQL Auth Proxy      Database proxy       600 s
 //   AWS RDS Proxy                 Database proxy       configurable
@@ -21,9 +21,15 @@
 //   notification to the Go application.
 //
 // Go's pool does not know the connection was dropped.
-// It marks the connection as healthy (idle) and reuses it for the next query.
-// The next query tries to write on a dead socket → TCP RST comes back →
-//   "read tcp ...: connection reset by peer"  (ECONNRESET)
+// The next query picks up the dead socket and tries to write on it.
+// TCP RST comes back → "read tcp ...: connection reset by peer" (ECONNRESET).
+//
+// database/sql has a built-in single retry: it maps ECONNRESET to
+// driver.ErrBadConn, discards the socket, and retries on a new connection —
+// silently hiding the error. Part A uses db.Conn() to pin one physical
+// socket so the retry cannot fire, making the error visible. This matches
+// the real production pattern: transactions and prepared statements are also
+// pinned to one connection and cannot be silently retried.
 //
 // ─────────────────────────────────────────────────────────────────────────────
 // How this demo works
@@ -44,6 +50,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"net"
@@ -64,7 +71,7 @@ const (
 
 	// proxyIdleTimeout: how long the proxy waits before dropping an idle connection.
 	// This simulates the idle timeout of whatever sits between your app and the DB.
-	// Real values: AWS ALB=60s, Azure SQL GW=30s, GCP Cloud SQL Proxy=600s.
+	// Real values: AWS Application Load Balancer=60s, Azure SQL Gateway=30s, GCP Cloud SQL Proxy=600s.
 	// We use 3s so the demo runs quickly.
 	proxyIdleTimeout = 3 * time.Second
 )
@@ -211,16 +218,22 @@ func runPartA() {
 	fmt.Println("  [Go app] ──► [TCP proxy :5442] ──► [PostgreSQL :5440]")
 	fmt.Println()
 	fmt.Println("  The proxy simulates any intermediary with an idle-connection timeout.")
-	fmt.Println("  (AWS ALB, GCP Cloud SQL Proxy, RDS Proxy, firewall, NAT, etc.)")
+	fmt.Println("  (AWS Application Load Balancer, GCP Cloud SQL Proxy, RDS Proxy, firewall, NAT, etc.)")
 	fmt.Println()
-	fmt.Printf("  Proxy idle timeout : %v  (real AWS ALB default = 60s)\n", proxyIdleTimeout)
+	fmt.Printf("  Proxy idle timeout : %v  (real AWS Application Load Balancer default = 60s)\n", proxyIdleTimeout)
 	fmt.Println("  ConnMaxLifetime   : 0  (never recycle)")
 	fmt.Println("  ConnMaxIdleTime   : 0  (never recycle)  ← the misconfiguration")
 	fmt.Println()
+	fmt.Println("Why db.Conn() instead of db.Exec():")
+	fmt.Println("  database/sql has a built-in retry: when lib/pq returns driver.ErrBadConn")
+	fmt.Println("  (which ECONNRESET maps to), db.Exec() silently retries on a new connection.")
+	fmt.Println("  db.Conn() pins you to ONE physical TCP socket — no retry is possible,")
+	fmt.Println("  so the error surfaces just as it does in transactions and prepared statements.")
+	fmt.Println()
 	fmt.Println("Expected timeline:")
-	fmt.Printf("  t=0s   Query 1 runs → connection becomes idle in pool\n")
+	fmt.Printf("  t=0s   Query 1 runs → TCP connection goes idle\n")
 	fmt.Printf("  t=%vs  Proxy RST-closes the idle connection\n", proxyIdleTimeout.Seconds())
-	fmt.Printf("  t=5s   Query 2 reuses the dead connection → error\n")
+	fmt.Printf("  t=5s   Query 2 writes to a dead socket → connection reset by peer\n")
 	fmt.Println()
 
 	proxy := newProxy()
@@ -232,40 +245,38 @@ func runPartA() {
 	}
 	defer db.Close()
 	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
 	// Intentionally NOT setting ConnMaxLifetime or ConnMaxIdleTime — this is the bug.
+	// (SetMaxIdleConns is irrelevant here: db.Conn() holds the socket exclusively
+	// and never returns it to the idle pool between queries.)
 
-	if err := db.Ping(); err != nil {
+	// db.Conn() acquires ONE physical connection and holds it exclusively.
+	// Queries on this handle go directly to that socket — database/sql cannot
+	// swap in a fresh connection and retry behind our back.
+	conn, err := db.Conn(context.Background())
+	if err != nil {
 		fmt.Printf("  Cannot connect through proxy: %v\n  Make sure pg-normal is running: make up\n", err)
 		return
 	}
+	defer conn.Close()
 
 	fmt.Printf("  [%s] Query 1 → ", now())
-	if _, err := db.Exec("SELECT 1"); err != nil {
+	if _, err := conn.ExecContext(context.Background(), "SELECT 1"); err != nil {
 		fmt.Printf("UNEXPECTED ERROR: %v\n", err)
 		return
 	}
-	fmt.Println("OK   (connection is now idle in pool)")
+	fmt.Println("OK   (TCP connection is now idle — no data flowing through proxy)")
 
 	sleepFor := proxyIdleTimeout + 2*time.Second
 	fmt.Printf("  [%s] Sleeping %v (longer than proxy timeout)...\n", now(), sleepFor)
 	time.Sleep(sleepFor)
 
-	fmt.Printf("  [%s] Query 2 (reusing stale connection) → ", now())
-	_, err = db.Exec("SELECT 1")
+	fmt.Printf("  [%s] Query 2 (writing to dead socket) → ", now())
+	_, err = conn.ExecContext(context.Background(), "SELECT 1")
 	if err != nil {
 		fmt.Printf("ERROR\n")
 		fmt.Printf("  [%s]   %v\n", now(), err)
-		fmt.Println()
-		fmt.Printf("  [%s] Retry (pool evicts dead connection, opens fresh one) → ", now())
-		if _, err2 := db.Exec("SELECT 1"); err2 != nil {
-			fmt.Printf("ERROR: %v\n", err2)
-		} else {
-			fmt.Println("OK")
-		}
 	} else {
-		fmt.Println("OK  (db/sql retried internally — error hidden from caller)")
-		fmt.Println("  Note: even when hidden, the failed attempt still adds latency.")
+		fmt.Println("OK  (unexpected — connection survived)")
 	}
 
 	fmt.Println()
@@ -278,8 +289,10 @@ func runPartA() {
 	fmt.Println("Key Takeaway:")
 	fmt.Printf("  The proxy dropped the idle connection after %v — Go's pool didn't know.\n", proxyIdleTimeout)
 	fmt.Println("  Reusing that dead socket caused 'connection reset by peer'.")
-	fmt.Println("  In production this happens with AWS ALB, RDS Proxy, GCP Cloud SQL")
+	fmt.Println("  In production this happens with AWS Application Load Balancer, RDS Proxy, GCP Cloud SQL")
 	fmt.Println("  Proxy, Azure SQL Gateway, firewalls, NAT gateways, and more.")
+	fmt.Println("  It's especially painful inside transactions and prepared statements,")
+	fmt.Println("  where database/sql's silent retry cannot help you.")
 }
 
 // ─── Part B: the fix ─────────────────────────────────────────────────────────
@@ -369,7 +382,7 @@ func runPartB() {
 	fmt.Println("    db.SetConnMaxLifetime(intermediaryTimeout - buffer)")
 	fmt.Println()
 	fmt.Println("  Common values (subtract 5-10s as buffer):")
-	fmt.Println("    AWS ALB                60s  → ConnMaxIdleTime=55s")
+	fmt.Println("    AWS Application Load Balancer   60s  → ConnMaxIdleTime=55s")
 	fmt.Println("    Azure SQL Gateway      30s  → ConnMaxIdleTime=25s")
 	fmt.Println("    GCP Cloud SQL Proxy   600s  → ConnMaxIdleTime=590s")
 	fmt.Println("    AWS RDS Proxy          configurable — check your setting")
