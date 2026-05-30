@@ -1,4 +1,4 @@
-.PHONY: up down wait tidy scenario1 scenario2 scenario3 scenario4 loadtest loadtest-small loadtest-server help
+.PHONY: up down wait tidy scenario1 scenario2 scenario3 scenario4 scenario5 loadtest loadtest-ok loadtest-small loadtest-server help
 
 DSN_NORMAL  = "host=localhost port=5440 dbname=demo user=demo password=demo sslmode=disable"
 DSN_LIMITED = "host=localhost port=5441 dbname=demo user=demo password=demo sslmode=disable"
@@ -9,22 +9,23 @@ help:
 	@echo "======================================="
 	@echo ""
 	@echo "Infrastructure:"
-	@echo "  make up          Start both PostgreSQL containers"
-	@echo "  make down        Stop and remove containers"
-	@echo "  make wait        Wait until both containers are healthy"
-	@echo "  make tidy        Download Go dependencies"
+	@echo "  make up               Start both PostgreSQL containers"
+	@echo "  make down             Stop and remove containers"
+	@echo "  make wait             Wait until both containers are healthy"
+	@echo "  make tidy             Download Go dependencies"
 	@echo ""
 	@echo "Scenarios:"
-	@echo "  make scenario1   Server max_connections=10 vs 15 workers"
-	@echo "  make scenario2   App pool=3 vs 9 workers (degrade + error)"
-	@echo "  make scenario3   MaxIdleConns and ConnMaxIdleTime"
-	@echo "  make scenario4   All 5 timeout parameters"
+	@echo "  make scenario1        Server max_connections=10 vs 15 workers"
+	@echo "  make scenario2        App pool=3 vs 9 workers (degrade + error)"
+	@echo "  make scenario3        MaxIdleConns and ConnMaxIdleTime (good + bad side)"
+	@echo "  make scenario4        All 5 timeout parameters"
+	@echo "  make scenario5        Stale connection / connection reset by peer"
 	@echo ""
 	@echo "Load tests:"
-	@echo "  make loadtest          Default: pool=5, workers=20, qtime=0.1s"
-	@echo "  make loadtest-ok       Healthy: pool=20, workers=20 (no contention)"
-	@echo "  make loadtest-small    Saturated: pool=3, workers=20 (high wait)"
-	@echo "  make loadtest-server   Hit server limit: pool=20, db=pg-limited"
+	@echo "  make loadtest         Default: pool=5, workers=20, qtime=0.1s (contention)"
+	@echo "  make loadtest-ok      Healthy: pool=20, workers=20 (no contention)"
+	@echo "  make loadtest-small   Saturated: pool=3, workers=20 (high wait)"
+	@echo "  make loadtest-server  Hit server limit: pool=20, db=pg-limited (port 5441)"
 	@echo ""
 
 up:
@@ -35,10 +36,10 @@ down:
 	docker compose down
 
 wait:
-	@echo "Waiting for postgres-normal  (port 5432)..."
+	@echo "Waiting for postgres-normal  (port 5440)..."
 	@until docker exec pg-normal pg_isready -U demo -d demo > /dev/null 2>&1; do sleep 1; done
 	@echo "  postgres-normal  is ready."
-	@echo "Waiting for postgres-limited (port 5433)..."
+	@echo "Waiting for postgres-limited (port 5441)..."
 	@until docker exec pg-limited pg_isready -U demo -d demo > /dev/null 2>&1; do sleep 1; done
 	@echo "  postgres-limited is ready."
 	@echo ""
@@ -58,6 +59,9 @@ scenario3:
 
 scenario4:
 	go run ./scenarios/04_timeouts/
+
+scenario5:
+	go run ./scenarios/05_stale_connections/
 
 loadtest:
 	go run ./loadtest/ -pool 5 -workers 20 -qtime 0.1 -dur 15s

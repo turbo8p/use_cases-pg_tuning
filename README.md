@@ -51,7 +51,8 @@ The two most common problems:
 │   ├── 01_server_max_conn/          # Server-side limit hit
 │   ├── 02_pool_exhaustion/          # App-side pool too small
 │   ├── 03_idle_connections/         # MaxIdleConns + ConnMaxIdleTime
-│   └── 04_timeouts/                 # All timeout types
+│   ├── 04_timeouts/                 # All timeout types
+│   └── 05_stale_connections/        # Stale conn / connection reset by peer
 └── loadtest/                        # Configurable load test
 ```
 
@@ -75,6 +76,7 @@ make scenario1   # server limit
 make scenario2   # pool exhaustion
 make scenario3   # idle connections
 make scenario4   # timeouts
+make scenario5   # stale connection / connection reset by peer
 
 # 3. Run the load test
 make loadtest         # pool=5, workers=20 → contention
@@ -388,6 +390,88 @@ Closes connections that have been sitting in the pool unused for too long.
 ```
 t=+0s  Idle=5 [#####]  MaxIdleTimeClosed=0
 t=+3s  Idle=0 [.....]  MaxIdleTimeClosed=5
+```
+
+---
+
+## Scenario 5 — Stale Connections ("connection reset by peer")
+
+**File:** `scenarios/05_stale_connections/`
+
+This is a production war story turned into a reproducible demo.
+
+### What causes this error in production?
+
+Something **between** your Go app and PostgreSQL closes an idle TCP connection without telling Go's pool. Common culprits:
+
+| Intermediary | Default idle timeout |
+|---|---|
+| AWS ALB | **60 s** |
+| Azure SQL Gateway | **30 s** (hard limit) |
+| GCP Cloud SQL Proxy | **600 s** |
+| Most stateful firewalls | 300–600 s |
+| PostgreSQL `idle_session_timeout` | disabled by default |
+
+When that timeout fires, the intermediary sends a TCP **RST** packet to the Go side. Go's pool does not know — it still marks the connection as healthy (idle). The next query that picks up that connection tries to write to a dead socket and gets:
+
+```
+read tcp 127.0.0.1:...: connection reset by peer
+```
+
+### How the demo works
+
+```
+[Go app] ──► [TCP proxy :5442] ──► [PostgreSQL :5440]
+```
+
+A local TCP proxy simulates the load balancer. It calls `SetLinger(0)` + `Close()` on any connection that has been idle for 3 seconds — this sends RST, exactly what a real LB does when it removes a connection from its state table.
+
+### Part A — The problem (`ConnMaxIdleTime=0`)
+
+```
+[18:21:03] Query 1 → OK   (connection returned to idle pool)
+[18:21:03] Sleeping 5s...
+[LB-proxy 18:21:06] idle 3s → RST-closing (simulates LB timeout)
+[18:21:08] Query 2 → OK  (db/sql retried internally — caller didn't see the error)
+           Note: even when hidden, the failed attempt still added latency.
+
+LB proxy force-closed 1 connection(s) via RST
+MaxIdleTimeClosed : 0   ← Go never cleaned this up; LB had to
+```
+
+Even though `database/sql` hid the error by retrying internally, the LB still force-closed one connection. In a high-traffic system this retry adds latency on every request that hits a stale connection. And some versions of `lib/pq` surface the raw error instead of retrying, so callers **do** see it.
+
+### Part B — The fix (`ConnMaxIdleTime=2s`, LB timeout=3s)
+
+```
+[18:21:08] Query 1 → OK
+[18:21:08] Sleeping 5s (watching pool stats)...
+
+t=+1s  Idle=1  MaxIdleTimeClosed=0
+t=+2s  Idle=1  MaxIdleTimeClosed=0
+t=+3s  Idle=0  MaxIdleTimeClosed=1  ← Go closed the connection proactively (before LB!)
+t=+4s  Idle=0  MaxIdleTimeClosed=1
+t=+5s  Idle=0  MaxIdleTimeClosed=1
+
+[18:21:13] Query 2 → OK  (pool opened a fresh connection — no error!)
+
+LB proxy force-closed 0 connection(s) via RST   ← proxy never had to fire
+MaxIdleTimeClosed : 1   ← Go recycled it first
+```
+
+By setting `ConnMaxIdleTime=2s` (1 second shorter than the LB's 3s), Go closed and discarded the connection before the LB could RST it. Query 2 opened a brand-new connection through the (still-running) proxy and succeeded cleanly.
+
+**Key lesson:**  
+Always set `ConnMaxIdleTime` and `ConnMaxLifetime` to a value **shorter than** whatever sits between your app and PostgreSQL. A 5–10 second buffer is usually enough.
+
+```go
+// Example: your LB has a 60s idle timeout
+db.SetConnMaxIdleTime(55 * time.Second)
+db.SetConnMaxLifetime(55 * time.Second)
+
+// Example: Azure SQL Gateway (30s hard limit — tightest common case)
+db.SetConnMaxIdleTime(25 * time.Second)
+db.SetConnMaxLifetime(25 * time.Second)
 ```
 
 ---
